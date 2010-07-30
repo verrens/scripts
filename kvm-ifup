@@ -1,0 +1,16 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+my $iface = shift
+    or die "Usage: $0 <iface>";
+
+print "Add $iface to $_: ",
+    qx[
+        /sbin/ifconfig $iface 0.0.0.0 up
+        /usr/sbin/brctl addif $_ $iface
+    ],"\n"
+        for (
+            ($iface =~ /^br_(\w+)_/) ? $1 :
+            ()
+        )

@@ -1,0 +1,107 @@
+#! /usr/bin/perl
+use strict;
+
+use Data::Dumper;
+
+use Getopt::Long;
+use Pod::Usage;
+# Args defaults
+my %args = (
+    sleep   => 1,
+);
+GetOptions(\%args,
+    'verbose+',
+    'sleep=i',
+    'marker',
+    'help|?',
+    'grep=s',
+#    'wrap=i', # BOGUS
+    'flush',
+    'delta',
+    'zip',
+) or pod2usage(2);
+
+($args{help} 
+or not ( my $fname = shift )
+) and die pod2usage(2);
+
+
+$|=1 if $args{flush};
+
+my @old;
+while (1) {
+    my $i=0;
+    open my $f, $fname;
+    while (<$f>){
+        my $j=0;
+        next if
+            $args{grep}
+            and not m/$args{grep}/;
+        $i++;
+
+        s/\s{2,}/ /g
+            if $args{zip};
+
+        s/\b(\d+)\b/ 
+             my $oridelta = my $delta = $1 - $old[$i][$j];
+             $old[$i][$j++] = $1;
+             $delta =
+                $delta > 1_000_000 ? sprintf( "%.3fM", $delta * 0.001 * 0.001 ) :
+                $delta > 1_000 ? sprintf( "%.2fK", $delta * 0.001 )  :
+                $delta;
+             $delta
+                ? " " x (length($1) - length($delta))
+                    . "\e[1;34m$delta\e[0m"
+                : $1
+        /gex if $args{delta};
+
+        s/^(.{@{[ $args{wrap} - 1 ]}}).+/$1\//
+            if $args{wrap};
+
+
+        print
+    }
+    print "=" x $args{wrap} || 45, "\n"
+        if $args{marker};
+    sleep $args{sleep}
+}
+
+__END__
+
+=head1 NAME
+
+magicat
+
+=head1 SYNOPSIS
+
+ magicat [options] <file>
+
+ Options:
+ -delta           show numeric delta
+ -grep=s          grep pattern
+ -sleep=i         sleep timeout
+ -wrap=i          show only N first chars
+ -marker          show marker
+ -zip             zip spaces
+ -flush           enable autoflush
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+
+
+=item B<-man>
+
+
+
+=back
+
+=head1 DESCRIPTION
+
+#FIXME Write me!
+
+=cut
+
