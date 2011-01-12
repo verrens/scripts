@@ -1,0 +1,163 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+use bytes;
+use integer;
+use Sys::Syslog;
+use POE qw(Component::Server::TCP Wheel::Run);
+
+## Setup
+my $AllowedChars =
+    qr/[^\s\w\d+-=!`~\@#\$\%^&*(),.\/?:;\[\]{}<>"'|]/i;
+use constant {
+    # Path to gnokii binary
+    # %s expand to phone number
+    GNOKII_PATH => '/usr/bin/gnokii --sendsms %s',
+    # Sending timeout
+    TIMEOUT => 17,
+    # Queue array constants
+    POSTBACK => 0,
+    SIP => 1,
+    PHONE => 2,
+    MSG => 3,
+    CHILD => 4,
+    DATA => 5,
+    ERROR => 6,
+};
+##
+
+POE::Session->create (
+    inline_states => {
+        _start =>
+            sub { $_[KERNEL]->alias_set('sms_sender') },
+        queue_sms => sub {
+            # Enqueue message
+            push @{ $_[HEAP]->{queue} },
+                [ @_[ ARG0..ARG3 ] ];
+            # Try to send SMS
+            $_[KERNEL]->yield('send_sms')
+        },
+        send_sms => sub {
+            my ($kernel, $heap) =
+                @_[KERNEL, HEAP];
+            return
+                if $heap->{job}; # In job
+            my $sms = shift @{$heap->{queue}}
+                or return; # Queue empty
+            # Spawn gnokii child process
+            my $child =
+                POE::Wheel::Run->new(
+                    Program =>
+                        sprintf(GNOKII_PATH, $sms->[PHONE]),
+                    StdinEvent => 'send_eof',
+                    StdoutEvent => 'child_in',
+                    StderrEvent => 'child_in',
+                ) or die 'Can`t spawn POE::Wheel::Run';
+            $kernel->sig_child($child->PID, "child_die");
+            # New job
+            $heap->{job} = [ @{$sms}, $child ];
+            # Timeout
+            $kernel->delay(child_timeout => TIMEOUT, 0);
+            # Send message to stdin
+            $child->put($sms->[MSG]."\n")
+        },
+        send_eof => sub { $_[HEAP]->{job}->[CHILD]->shutdown_stdin },
+        child_in =>
+            # Save output lines
+            sub { push @{$_[HEAP]->{job}->[DATA]}, $_[ARG0] },
+        child_timeout => sub {
+            my ($kernel, $heap, $kill) =
+                @_[ KERNEL, HEAP, ARG0 ];
+            my $job = $heap->{job}
+                or return;
+            # Try to terminate
+            $job->[CHILD]->kill( $kill ? 9 : () );
+            $job->[ERROR] = "TIMEOUT".
+                ($kill ? " (KILLED)" : "");
+            # If child not terminated,
+            # try to kill it in next timeout
+            $kernel->delay(child_timeout => TIMEOUT, ++$kill);
+        },
+        child_die => sub {
+            my ($kernel, $heap) =
+                @_[KERNEL, HEAP];
+            # Clear timeout
+            $kernel->delay('child_timeout');
+            # Get and clean job data
+            my ($postback, $sip, $phone, $msg,
+                    undef, $data, $error) = 
+                @{delete $heap->{job} or return};
+            $error = "NOT SEND: ".
+                ($error ? "$error, " : "").
+                "OUTPUT: ".join(", ", @{$data})
+                    unless scalar grep
+                        { /Send succeeded/ } @{$data};
+            # Reply to requester
+            $postback->($error);
+            # If messages in queue, send it
+            $_[KERNEL]->yield('send_sms')
+        }
+    }
+);
+
+POE::Component::Server::TCP->new (
+    Alias => "sms_server",
+    Port => 11201,
+    ClientInput => sub {
+        my ($kernel, $session, $heap, $input) =
+            @_[ KERNEL, SESSION, HEAP, ARG0 ];
+        my $sip = $heap->{remote_ip}
+            or die "Brain damage: no source IP";
+        # Filter input data
+        $input =~ s/$AllowedChars/_/og;
+	    if (my ($phone, $message) = $input =~
+                /^([+]*\d{11})\s+(.{1,160}$)/) {
+            $kernel->post(sms_sender => queue_sms =>
+                    $session->postback
+                        ( client_output=>$sip, $phone, $message ),
+                    $sip, $phone, $message)
+                or do {
+                    syslog "err",
+                        "[$sip] Brain damage: send to sms srv";
+    		        $heap->{client}->put(
+                        "! INTERNAL ERROR");
+    	            $heap->{shutdown}++;
+                    $kernel->post(sms_server => "shutdown")
+                };
+            ## FIXME How it flush?
+    		$heap->{client}->put(
+                ", ACCEPT, please stand by..");
+    	}
+        else {
+            syslog "warning",
+                "[$sip] ERROR: Illegal message $input";
+    		$heap->{client}->put(
+                "! Illegal input");
+    	    $heap->{shutdown}++ # Disconnect
+    	}
+    },
+    InlineStates => {
+        client_output => sub {
+            my $heap = $_[HEAP];
+            my ($sip, $phone, $msg) = @{$_[ARG0]};
+            my ($rv) = @{$_[ARG1]};
+            return
+                unless defined $heap->{client};
+            # Logging
+            syslog $rv ? "warning" : "info",
+                "[$sip] $phone => '$msg'".
+                    ($rv ? " (ERROR: $rv)" : '');
+            $heap->{client}->put($rv
+                ? "! $rv"
+                : ". SEND"
+            );
+    	    $heap->{shutdown}++ # Disconnect
+        }
+    }
+);
+
+####################
+openlog "qsms", 'pid,perror', 'local0';
+$poe_kernel->run();
+closelog
+####################
