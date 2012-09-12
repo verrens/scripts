@@ -10,6 +10,7 @@ my %args = (
     sleep   => 1,
 );
 GetOptions(\%args,
+    'auto',
     'verbose+',
     'sleep=i',
     'marker',
@@ -20,6 +21,8 @@ GetOptions(\%args,
     'delta',
     'zip',
 ) or pod2usage(2);
+@args{qw/marker delta zip/} = (1..3)
+    if $args{auto};
 
 ($args{help} 
 or not ( my $fname = shift )
@@ -61,7 +64,7 @@ while (1) {
 
         print
     }
-    print "=" x $args{wrap} || 45, "\n"
+    print "=" x ($args{wrap} || 45), "\n"
         if $args{marker};
     sleep $args{sleep}
 }
