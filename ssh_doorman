@@ -1,0 +1,161 @@
+#! /usr/bin/perl -tT
+#
+# SSH DoorMan
+#
+# Copyright (C) 2011-2012 Afonin Denis
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+#
+# The author can be reached via email: Afonin Denis <den@itkm.su>
+#
+use warnings;
+use strict;
+use Unix::Syslog qw(:macros);    # Syslog macros
+use Unix::Syslog qw(:subs);      # Syslog functions
+
+## Setup
+my $paranoid = 1;
+my $scp_allow = 1;
+my $sftp_allowed = 1;
+
+my $rsync_path = "/usr/bin/rsync"; # Allow rsync access
+
+my %telnet = ( # {{{
+    path => "/usr/bin/telnet",
+    args => [ "-4" ],
+    port => 23,
+    allowed => {
+        '172.0.0.1' => 23,
+    },
+);#}}}
+
+my $my = ($0 =~ /ssh_doorman_(\w+)/) ? $1 : 'doorman';
+
+sub exec_telnet ($$) {#{{{
+    my ($host, $port) = @_;
+    die "How I can connect to $host:$port?"
+        unless $host and $port > 0;
+    die "Telnet at $telnet{path} expected!\n"
+        unless -x $telnet{path};
+    exec $telnet{path}, @{$telnet{args}||{}}, $host,
+        $port||$telnet{port};
+    die "Wow! Can`t exec!"
+}#}}}
+
+BEGIN {
+    openlog "doorman", LOG_PID, LOG_AUTH;
+    $SIG{__DIE__} = sub {
+        syslog LOG_ERR, "$0: died: %s", "@_";
+        print "?Get out of there, please!\n";
+        exit
+    };
+    $SIG{__WARN__} = sub {
+        syslog LOG_WARNING, "$0: %s", "@_"
+    };
+}
+
+# Check myself
+$ENV{PATH} = "/bin:/sbin";
+
+# Just in memory
+my $ipre = qr/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/;
+
+my ($from, $from_port, $my_port) = (
+    $ENV{SSH_CLIENT} =~ /($ipre) (\d+) (\d+)/ );
+my ($login) = ( $ENV{LOGNAME} =~ /^([\w\_\-]+$)/ );
+die "Check my and sshd`s brains!"
+    unless $my_port and $login;
+
+syslog LOG_INFO, "$login knocking on from $from:$from_port"
+    if $paranoid;
+
+my ($say) = ( ($ENV{SSH_ORIGINAL_COMMAND} || '') =~ /^(.{1,256})$/ );
+exit unless $say; # Silent, strange.. FIXME Shell!
+
+if ($my eq 'libvirt') {
+    # Directly calling netcat
+    # TODO HardCo[rd]ed!
+    my $cmd;
+    $cmd =
+        /'*nc'* (?:\$ARG |)-U \/var\/run\/libvirt\/libvirt-sock/
+            ? "/bin/nc -q 0 -U /var/run/libvirt/libvirt-sock" :
+        /nc 127.0.0.1 (590\d)/
+            ? "/bin/nc -q 0 127.0.0.1 $1" :
+        # Attach to virt manager TTY
+        /attach (\w[\w\d\_\-]{0,32})/
+            ? do {
+                my $vdom=$1;
+                die "No virsh program found!" unless -x "/usr/bin/virsh";
+                my ($host, $port) = (`/usr/bin/virsh -c qemu:///system dumpxml $vdom` =~
+                    # FIXME Only first TCP port... And ugly!
+                    /<source mode='bind' host='(127\.0\.0\.1)' service='(\d+)'\/>/);
+                unless ($host and int $port > 0) {
+                    print "?Domain $vdom not found?\n";
+                    warn "No serial-to-TCP-port for domain $vdom";
+                    exit;
+                };
+                warn "Attaching to virt $vdom (telnet $host:$port)..\n"
+                    if $paranoid;
+                exec_telnet $host, $port
+            } :
+	# FIXME Security
+	/virsh/ ? '/usr/bin/virsh -c qemu:///system' :
+        die "$my: Strange command '$_'"
+            for $say;
+    syslog LOG_INFO, "$my: staring libvirt session, exec('$cmd')";
+    closelog;
+    exec $cmd or die "Can`t exec!"
+}
+
+for ($say) {
+    /^(?:hello|hi)/i ? print "!Hi $login from $from:$from_port!\n" : 
+
+    $my eq 'libvirt' && /^telnet\s+($ipre)(?:\s+(\d+)|)$/ ? do {#{{{
+        # FIXME Only single port per host
+        my $port = int($2) || $telnet{allowed}->{$1} || $telnet{port};
+        unless ($telnet{allowed}->{$1}
+                and $telnet{allowed}->{$1} == $port) {
+            warn "Attempt to disallowed telnet $1 $port!";
+            print "?Go away, please.\n";
+            exit
+        }
+        syslog LOG_INFO, "Telneting to %s:%d", $1, $port
+            if $paranoid;
+            exec_telnet $1, $port
+    } :#}}}
+
+    $my eq 'rsync' && /^rsync\s+--server(?:\s+(.+)|)$/ && $rsync_path ? do {
+        die "Rsync binary expected at $rsync_path!\n"
+            unless -x $rsync_path;
+        my $extra_args = $1 || '';
+        syslog LOG_INFO, "Rsync extra args: %s", $extra_args
+            if $extra_args and $paranoid;
+        syslog LOG_INFO, "Starting rsync server"
+            if $paranoid;
+        exec $rsync_path, "--server", split /\s+/, $extra_args
+    } :
+
+    do {
+        syslog LOG_WARNING, "Unexpected command %s", $say
+            if $paranoid;
+        print "?Sorry, but I don`t understand.\n"
+    }
+}
+
+END {
+    closelog
+}
+
+1
