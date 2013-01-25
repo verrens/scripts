@@ -1,0 +1,83 @@
+#! /usr/bin/perl
+#
+# TODO:
+# ./pgdb `pidof -s a.out` restore execv binary banner
+#
+use strict;
+use warnings;
+use File::Temp;
+use Getopt::Long;
+use Devel::GDB;
+
+my $verbose=0;
+my $sh_env;
+my $inject;
+my $pid;
+my $args;
+GetOptions (
+    "verbose+" => \$verbose,
+    "env" => \$sh_env,
+    "inject=s" => \$inject,
+    "pid=i" => \$pid,
+    "args=s" => \$args,
+);
+open STDERR, '>/dev/null'
+    unless $verbose;
+
+my $d = new Devel::GDB (
+#    '-use-threads' => 1 ,
+    '-create-expect' => 1,
+    '-params' => $args||"",
+);
+
+sub gdb {
+    my $cmd = "@_";
+    my $rv = $d->send_cmd($cmd)
+        or die "CMD '$cmd'";
+    warn "Cmd '$cmd': $rv\n" if $verbose;
+    $rv
+}
+
+sub attach {
+    my $pid = shift;
+    my $exe = readlink "/proc/$pid/exe"
+        or die "Get exe of '$pid'";
+
+    warn "Path to file: '$exe'\n" if $verbose;
+    gdb("file $exe");
+    gdb("attach $pid");
+}
+
+sub get_environ {
+    for my $i (0..512) {
+        my ($key, $val) = $d->get("print environ[$i]")
+            =~ /\"([^=]+)=(.*)$/ or last;
+        $val =~ s/\"(\n|)$//;
+        print "$key => $val\n";
+    }
+}
+
+sub inject {
+    my $cf = shift;
+    my $cl = (stat $cf)[7]
+        or return; # Nothing to do
+    my ($addr) = $d->get("call malloc($cl)") =~ /(0x[\da-fA-F]+)/
+        or return; # or die?
+    gdb("restore $cf binary $addr");
+    gdb("call $addr()");
+    gdb("call free($addr)");
+}
+
+
+$pid and attach($pid);
+
+if ($sh_env) {
+    get_environ()
+}
+
+elsif ($inject) {
+    inject($inject);
+}
+else {
+    print $d->get($_) for @ARGV;
+}
